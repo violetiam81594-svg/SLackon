@@ -2,21 +2,83 @@
 
 Issueless
 
-## Trusted Types Implementation and Performance Optimization
+## Slack API Integration: Cookie Integrity & Security Optimization
 
-This project focuses on preventing DOM-based XSS by enforcing Trusted Types and improving the performance of the sanitization policies used in client-side rendering.
+This project should treat Slack session data and any identity-bearing cookies as high-value secrets. The primary goal is to prevent theft via JavaScript execution, reduce CSRF exposure, and avoid storing sensitive state in client-accessible storage.
 
-### Why this matters
+### Security findings
 
-DOM-based XSS can occur when untrusted input is passed into sinks such as `innerHTML`, `outerHTML`, or similar APIs without sanitization. Trusted Types helps by requiring that DOM sinks receive a `TrustedHTML`, `TrustedScript`, or `TrustedScriptURL` object instead of raw strings.
+The environment was audited for cookie security attributes and storage usage. The most relevant findings were:
 
-### Recommended pattern
+| Origin | Cookie Count | Notable Findings |
+| :--- | :--- | :--- |
+| Primary app origin | 3 | `cs-feature-flags` is large and not constrained to a server-side session; cookies are missing explicit `HttpOnly` and `SameSite` settings |
+| Asset origin | 0 | No cookies found |
+| CDN origin | 0 | No cookies found |
+
+Additional concerns:
+
+- `localStorage` and `sessionStorage` are currently empty, which is good, but they should remain avoided for Slack tokens.
+- Cookies are currently readable from `document.cookie`, which is a sign that `HttpOnly` is not being enforced.
+- Large JSON blobs in cookies increase request overhead and increase the attack surface for tampering and exfiltration.
+
+### Recommended requirements
+
+1. Never store Slack tokens in `localStorage` or `sessionStorage`.
+2. Set all auth cookies from the server, not from client-side JavaScript.
+3. Use `Secure`, `HttpOnly`, and `SameSite=Lax` or `SameSite=Strict` on all session cookies.
+4. Prefer `__Host-` prefixing for cookies that must be tied to a specific origin.
+5. Keep payloads small; move large configuration/state objects to a server-side session or dedicated API.
+
+### Server-side cookie example
+
+The following pattern is the correct way to issue a Slack session cookie:
+
+```http
+Set-Cookie: __Host-slack-session-token=YOUR_TOKEN; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600
+```
+
+Notes:
+
+- `HttpOnly` prevents JavaScript access and helps reduce XSS impact.
+- `SameSite=Lax` reduces CSRF risk for normal browser navigation workflows.
+- `Secure` ensures the cookie is only sent over HTTPS.
+- `__Host-` ensures the cookie is only sent to the host that created it and not to subdomains.
+
+### Important note about JavaScript
+
+This is not a safe client-side pattern for `HttpOnly` cookies:
+
+```js
+document.cookie = "slack_session_token=YOUR_TOKEN; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600";
+```
+
+`HttpOnly` is ignored when a cookie is set through `document.cookie` in the browser. The browser will still expose the cookie under JS if it was created without server-side flags. In practice, `HttpOnly` must be set by the server in the HTTP response headers.
+
+### CSP and script integrity
+
+Use a strict CSP to reduce the impact of XSS and prevent data exfiltration:
+
+```html
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://slack.com; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';">
+```
+
+Recommended practices:
+
+- Move inline scripts to external files when possible.
+- Avoid `eval()`, `new Function()`, and string-based timers.
+- Restrict third-party scripts and remote resources.
+- Use report-only mode early to discover violations before enforcing a stricter policy.
+
+### Trusted Types guidance
+
+If the app renders dynamic HTML, use Trusted Types and avoid raw `innerHTML` with unsanitized strings.
 
 ```js
 if (window.trustedTypes && window.trustedTypes.createPolicy) {
   const slackAiPolicy = window.trustedTypes.createPolicy('slack-ai-policy', {
     createHTML: (value) => {
-      return value
+      return String(value)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
@@ -28,58 +90,25 @@ if (window.trustedTypes && window.trustedTypes.createPolicy) {
 }
 ```
 
-### Enforcement
-
-To make the policy mandatory, add the following response header:
-
-```http
-Content-Security-Policy: require-trusted-types-for 'script';
-```
-
-This ensures that script execution is blocked unless the application passes trusted values through the proper API.
-
-### Performance guidance
-
-The main performance risks in Trusted Types implementations are:
-
-- Synchronous sanitization logic in `createHTML` that blocks the main thread
-- Recreating security policies inside loops or hot paths
-- Redundant sanitization of static content that is already trusted
-
-Best practices:
-
-- Create Trusted Types policies once at the application entry point
-- Sanitize only dynamic user-generated content
-- Avoid expensive regex-heavy sanitization in critical render paths
-- Use faster, battle-tested libraries like DOMPurify when needed
-- Check DevTools Performance for tasks longer than 50 ms and optimize them
-
-### CSP overview
-
-Content Security Policy (CSP) is a browser security mechanism that reduces the impact of XSS by defining which sources of scripts, styles, images, and other resources are allowed.
-
-A typical policy looks like this:
-
-```http
-Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.example.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:;
-```
-
-Core ideas:
-
-- Restrict trusted content to allowlisted origins
-- Block inline script and event-handler execution when possible
-- Avoid `eval()` and string-based script execution
-- Use `report-uri` or report-only mode to monitor policy violations
-- Prefer external scripts over inline code to improve performance and security
+Even with Trusted Types, prefer DOM APIs like `createElement`, `textContent`, and `setAttribute` whenever possible. This is safer and generally faster than building HTML strings.
 
 ### Recommended deployment strategy
 
-1. Start in report-only mode to identify violations.
-2. Move inline scripts and styles into external assets.
-3. Enforce Trusted Types and CSP gradually.
-4. Monitor violation reports and refine the allowlist.
-5. Keep the policy strict but practical for your app's required third-party resources.
+1. Set session cookies from the backend using explicit security flags.
+2. Use the `__Host-` prefix for origin-scoped session cookies.
+3. Keep Slack token values out of browser storage.
+4. Enforce CSP and Trusted Types in report-only mode first.
+5. Monitor violations before turning enforcement on.
+6. Reduce cookie payload size by moving configuration to server-side storage.
 
 ### Summary
 
-`SLackon` is designed around secure client-side rendering practices. The recommended approach is to combine Trusted Types with a strict CSP policy, restrict sanitization to dynamic content, and avoid expensive policy creation in hot paths.
+The secure model for Slack integration is:
+
+- server-issued, `HttpOnly`, `Secure`, `SameSite` cookies
+- no token storage in client-side JavaScript storage
+- origin-scoped `__Host-` cookies
+- strict CSP and Trusted Types for HTML sinks
+- minimized payloads and server-side session state
+
+This approach substantially reduces the risk of XSS, CSRF, and cookie theft while preserving performance and maintainability.
